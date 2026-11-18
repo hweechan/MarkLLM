@@ -1,3 +1,7 @@
+## Experimental two-model branch watermarking (fork extension)
+
+This fork adds `BranchKGW`: draft-model candidate paths, target-model quality filtering, and KGW-based path selection. See the [Korean SSH setup and experiment guide](docs/branch_kgw_ko.md) and [CLI example](examples/branch_kgw.py). This is a research baseline, not exact speculative sampling or a demonstrated speedup.
+
 <div align="center">
 
 <img src="images/markllm-color-1.jpg" style="width: 40%;"/>

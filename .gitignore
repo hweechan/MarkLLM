@@ -177,3 +177,6 @@ cython_debug/
 .vscode
 .DS_Store
 watermark/XSIR/embedding/train_embeddings_10K.txt
+
+# Local branch watermark experiment outputs
+outputs/
