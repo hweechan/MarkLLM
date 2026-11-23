@@ -1,5 +1,10 @@
 """Offline CPU tests with random tiny causal models; no checkpoint downloads."""
 import unittest
+from unittest.mock import Mock, patch
+import contextlib
+import io
+import json
+import tempfile
 from pathlib import Path
 
 import torch
@@ -88,9 +93,78 @@ class BranchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.wm.generate('prompt')
 
+    def test_adaptive_gate_recomputed_and_mode_independent(self):
+        self.wm.options = BranchOptions(candidates=2, max_candidates=5,
+                                       block_size=1, max_new_tokens=1)
+        # A new best candidate invalidates the initial candidate. Final batch
+        # contains only one sample because the budget is not a batch multiple.
+        for watermarked in (True, False):
+            self.draft.generate = Mock(side_effect=[
+                torch.tensor([[2, 3, 4, 5], [2, 3, 4, 5]]),
+                torch.tensor([[2, 3, 4, 6], [2, 3, 4, 6]]),
+                torch.tensor([[2, 3, 4, 7]])])
+            self.wm._quality = Mock(side_effect=lambda ctx, c: {5: -1., 6: -.5, 7: -.6}[c[0]])
+            self.wm._green_flags = lambda ctx, c: [int(t == 7) for t in c]
+            result = self.wm.generate('prompt', watermarked=watermarked)
+            block = result['trace'][0]
+            self.assertEqual(block['eligible_indices'], [1, 2])
+            self.assertEqual(block['sampled_candidate_count'], 5)
+            self.assertEqual(block['duplicate_candidate_count'], 2)
+            self.assertEqual(self.wm._quality.call_count, 3)
+            self.assertEqual([c.kwargs['num_return_sequences']
+                              for c in self.draft.generate.call_args_list], [2, 2, 1])
+            self.assertEqual(result['generated_token_ids'], [7] if watermarked else [6])
+            self.assertEqual(block['selection_changed'], watermarked)
+            self.assertAlmostEqual(block['quality_loss'], .1 if watermarked else 0)
+            self.assertEqual(block['watermark_gain'], 1 if watermarked else 0)
+
+    def test_adaptive_stops_early_and_duplicate_budget(self):
+        self.wm.options = BranchOptions(candidates=2, max_candidates=6,
+                                       block_size=1, max_new_tokens=1)
+        self.wm._quality = Mock(return_value=-1.)
+        self.draft.generate = Mock(return_value=torch.tensor([[2, 3, 4, 5], [2, 3, 4, 6]]))
+        result = self.wm.generate('prompt')
+        self.assertEqual(self.draft.generate.call_count, 1)
+        self.assertEqual(result['trace'][0]['sampling_stop_reason'], 'eligible_target_met')
+        self.draft.generate = Mock(return_value=torch.tensor([[2, 3, 4, 1], [2, 3, 4, 1]]))
+        self.wm._quality.reset_mock()
+        result = self.wm.generate('prompt')
+        self.assertEqual(self.draft.generate.call_count, 3)
+        self.assertEqual(self.wm._quality.call_count, 1)
+        self.assertEqual(result['trace'][0]['sampling_stop_reason'], 'candidate_budget')
+        self.assertEqual(result['stop_reason'], 'eos')
+        self.assertEqual(result['diagnostics']['duplicate_candidates'], 5)
+
+    def test_comparison_cli_offline(self):
+        from examples.branch_kgw import main
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / 'compare.json')
+            argv = ['branch_kgw', '--compare', '--seeds', '42', '43',
+                    '--target-device', 'cpu', '--draft-device', 'cpu',
+                    '--dtype', 'float32', '--candidates', '2', '--max-candidates', '3',
+                    '--max-new-tokens', '1', '--output', output]
+            with patch('sys.argv', argv), patch(
+                    'examples.branch_kgw.AutoTokenizer.from_pretrained', return_value=self.tokenizer), patch(
+                    'examples.branch_kgw.AutoModelForCausalLM.from_pretrained',
+                    side_effect=[self.target, self.draft]) as loader, contextlib.redirect_stdout(io.StringIO()):
+                main()
+            self.assertEqual(loader.call_count, 2)
+            summary = json.loads((Path(directory) / 'compare.summary.json').read_text())
+            self.assertEqual([(r['seed'], r['mode']) for r in summary],
+                             [(42, 'watermarked'), (42, 'quality-only'),
+                              (43, 'watermarked'), (43, 'quality-only')])
+            for row in summary:
+                saved = json.loads(Path(row['output']).read_text())
+                self.assertEqual(saved['run']['mode'], row['mode'])
+                self.assertEqual(saved['run']['seed'], row['seed'])
+                self.assertIn('diagnostics', saved)
+                self.assertFalse(saved['detection_without_prompt']['threshold_is_calibrated'])
+
     def test_invalid_options(self):
         for kwargs in ({'epsilon': -1}, {'epsilon': float('nan')}, {'block_size': 0},
-                       {'temperature': 0}, {'top_p': 2}, {'candidates': 1.5}):
+                       {'temperature': 0}, {'top_p': 2}, {'candidates': 1.5},
+                       {'max_candidates': 3}, {'max_candidates': True},
+                       {'min_unique_eligible': 0}, {'min_unique_eligible': 1.5}):
             with self.assertRaises(ValueError):
                 BranchOptions(**kwargs)
         different = TinyTokenizer()

@@ -119,3 +119,57 @@ python -m unittest discover -s tests -p 'test_branch_kgw.py' -v
 ```
 
 현재 목표는 방법론의 기준 구현입니다. 이후 실제 모델 실험으로 강도를 확인한 다음 후보 배치 평가, KV cache 재사용, 절대 품질 fallback, 검출 calibration을 확장할 수 있습니다.
+
+## 8. 선택적 추가 샘플링과 진단
+
+기본값은 기존처럼 블록당 `--candidates 4`개를 한 번만 생성합니다.
+토큰 ID가 같은 후보는 최초 등장 순서대로 하나만 보존하고 Q/W를 한 번만
+평가합니다. 따라서 trace의 candidate index는 이제 고유 후보 목록 기준입니다.
+기존 JSON 필드는 유지되지만 후보 목록의 길이가 candidates보다 작을 수 있습니다.
+
+추가 샘플링을 켜려면 다음과 같이 실행합니다.
+
+```bash
+python -m examples.branch_kgw \
+  --candidates 4 --max-candidates 16 --min-unique-eligible 2 \
+  --epsilon 0.2 --max-new-tokens 128 \
+  --compare --seeds 42 43 44 \
+  --output outputs/adaptive.json
+```
+
+모델을 한 번 로드하고 각 seed에서 watermarked와 quality-only를 실행합니다.
+각 실행 직전에 seed를 재설정합니다. 개별 결과는
+`adaptive.watermarked.seed42.json`, `adaptive.quality-only.seed42.json` 등의
+파일로, 전체 실행 요약은 `adaptive.summary.json`으로 저장합니다.
+동일 seed도 선택 문맥이 갈라진 이후 동일 후보나 동일 계산량을 보장하지 않습니다.
+시간은 warm-up 없는 순차 실행의 참고값으로, 속도 개선의 증거가 아닙니다.
+
+블록마다 candidates개씩 추가 생성하며, 마지막 묶음은 남은 예산만 사용합니다.
+max-candidates는 중복을 포함한 전체 샘플 수의 상한입니다. 매 묶음 이후
+지금까지의 전체 고유 후보 중 최고 Q로 품질 조건을 다시 계산합니다.
+고유 유효 후보 수가 min-unique-eligible에 도달하거나 예산이 소진되면 종료합니다.
+종료 조건은 W 및 모드에 의존하지 않으며 epsilon도 자동으로 늘리지 않습니다.
+유효 후보가 여럿이어도 W가 같을 수 있습니다. 검출력 향상은 실험으로 확인해야 합니다.
+
+콘솔은 생성 모드, 종료 사유, 선택 진단, 검출 결과와 미보정 임계값을 구분합니다.
+JSON에는 다음이 추가됩니다.
+
+- `stop_reason`: eos 또는 max_new_tokens.
+- `diagnostics`: 전체 블록 수, 유효 고유 후보가 1개인 블록 수,
+  선택 변경 블록 수, 샘플/고유/중복 후보 수, 국소 W 이득 합계, 블록 평균 Q 손실.
+- 블록 trace: sampled_candidate_count, sampling_rounds, unique_candidate_count,
+  duplicate_candidate_count, unique_eligible_count, quality_best_index,
+  selection_changed, quality_loss, watermark_gain, selection_reason,
+  sampling_stop_reason.
+
+`quality_loss`는 현재 문맥에서 최고 Q와 선택 Q의 차이(nats/token)입니다.
+`watermark_gain`은 같은 후보 집합에서 선택 W와 최고 Q 후보 W의 차이입니다.
+EOS로 후보 길이가 다르면 W 차이를 Green 토큰 개수 차이로 해석하면 안 됩니다.
+이 국소 이득의 합계는 별도 quality-only 실행과의 총 Green 토큰 차이가 아닙니다.
+기존 detection 필드와 임계값 4.0은 유지하며 자동 calibration은 수행하지 않습니다.
+
+기준선은 동일 명령에서 `--max-candidates 16`을 빼고 다른 output 이름으로 실행합니다.
+후보 예산과 epsilon은 한 번에 하나씩 변경하세요. 이 비교 도구는 한 prompt의
+여러 seed 비교를 지원합니다. 여러 prompt는 각각 다른 output 이름으로 실행하세요.
+KV cache 재사용, 후보 배치 평가, target 단독 기준선 및 자동 임계값 보정은
+이번 변경에 포함하지 않습니다.
