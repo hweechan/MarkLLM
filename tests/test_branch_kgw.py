@@ -16,6 +16,7 @@ from watermark.branch_kgw.branch_kgw import select_candidate
 
 
 class TinyTokenizer:
+    chat_template = 'test-template'
     all_special_ids = [0, 1]
     pad_token_id = 0
     eos_token_id = 1
@@ -28,6 +29,9 @@ class TinyTokenizer:
 
     def encode(self, text, add_special_tokens=True):
         return [2, 3, 4]
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+        return [2, 8, 4]
 
     def decode(self, ids, skip_special_tokens=True):
         return ' '.join(str(i) for i in ids if i not in self.all_special_ids)
@@ -81,6 +85,21 @@ class BranchTests(unittest.TestCase):
         result = self.wm.generate('prompt')
         self.assertEqual(result['generated_token_ids'], [1])
         self.assertEqual(len(result['trace']), 1)
+
+    def test_direct_prompt_ids_and_fixed_detection(self):
+        self.draft.generate = Mock(side_effect=lambda **kw: torch.cat([
+            kw['input_ids'].repeat(3, 1), torch.full((3, kw['max_new_tokens']), 5)], dim=1))
+        result = self.wm.generate(prompt_token_ids=[2, 8, 4])
+        self.assertEqual(result['prompt_token_ids'], [2, 8, 4])
+        self.assertEqual(self.draft.generate.call_args_list[0].kwargs['input_ids'].tolist(), [[2, 8, 4]])
+        scores = self.wm.detect_fixed_lengths(result['generated_token_ids'], [3, 8])
+        self.assertEqual(scores['3']['num_tokens_scored'], 2)
+        self.assertFalse(scores['8']['available'])
+        self.assertIsNone(scores['8']['score'])
+        self.assertEqual(result['diagnostics']['selection_changed_block_rate'], 0)
+        self.assertAlmostEqual(result['diagnostics']['duplicate_candidate_rate'], 2 / 3)
+        with self.assertRaises(ValueError):
+            self.wm.generate('prompt', prompt_token_ids=[2])
 
     def test_budget_and_context(self):
         # Prevent EOS and verify a partial final block is generated.
@@ -142,6 +161,7 @@ class BranchTests(unittest.TestCase):
             argv = ['branch_kgw', '--compare', '--seeds', '42', '43',
                     '--target-device', 'cpu', '--draft-device', 'cpu',
                     '--dtype', 'float32', '--candidates', '2', '--max-candidates', '3',
+                    '--gamma', '0.25', '--detection-lengths', '1', '4',
                     '--max-new-tokens', '1', '--output', output]
             with patch('sys.argv', argv), patch(
                     'examples.branch_kgw.AutoTokenizer.from_pretrained', return_value=self.tokenizer), patch(
@@ -158,6 +178,12 @@ class BranchTests(unittest.TestCase):
                 self.assertEqual(saved['run']['mode'], row['mode'])
                 self.assertEqual(saved['run']['seed'], row['seed'])
                 self.assertIn('diagnostics', saved)
+                self.assertEqual(saved['prompt_token_ids'], [2, 8, 4])
+                self.assertEqual(saved['run']['kgw']['gamma'], .25)
+                scored = saved['detection_with_prompt']
+                self.assertAlmostEqual(scored['excess_green_tokens'], scored['green_tokens'] - .25)
+                self.assertEqual(saved['detection_fixed_lengths']['with_prompt']['1']['num_tokens_scored'], 1)
+                self.assertFalse(saved['detection_fixed_lengths']['with_prompt']['4']['available'])
                 self.assertFalse(saved['detection_without_prompt']['threshold_is_calibrated'])
 
     def test_invalid_options(self):

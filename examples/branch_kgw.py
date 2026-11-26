@@ -15,12 +15,16 @@ from watermark.kgw.kgw import KGWConfig
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--target', default='Qwen/Qwen2.5-1.5B')
-    parser.add_argument('--draft', default='Qwen/Qwen2.5-0.5B')
+    parser.add_argument('--target', default='Qwen/Qwen2.5-3B-Instruct')
+    parser.add_argument('--draft', default='Qwen/Qwen2.5-1.5B-Instruct')
     parser.add_argument('--target-device', default='cuda:0')
     parser.add_argument('--draft-device', default='cuda:0')
     parser.add_argument('--dtype', choices=['float32', 'float16', 'bfloat16'], default='bfloat16')
     parser.add_argument('--prompt', default='Explain why the sky appears blue in clear, simple terms.')
+    parser.add_argument('--prompt-format', choices=['chat', 'raw'], default='chat')
+    parser.add_argument('--gamma', type=float, default=0.5)
+    parser.add_argument('--detection-lengths', type=int, nargs='+', default=[64, 128],
+                        help='Exact continuation lengths for detection; short outputs are marked unavailable')
     parser.add_argument('--candidates', type=int, default=4)
     parser.add_argument('--max-candidates', type=int, default=None,
                         help='Per-block sampling budget; default: candidates (no retries)')
@@ -38,18 +42,30 @@ def main():
     parser.add_argument('--mode', choices=['watermarked', 'quality-only'], default='watermarked')
     parser.add_argument('--output', type=Path, default=Path('outputs/branch_kgw.json'))
     args = parser.parse_args()
+    if not 0 < args.gamma < 1:
+        parser.error('--gamma must be in (0, 1)')
+    if any(length < 1 for length in args.detection_lengths):
+        parser.error('--detection-lengths must be positive')
     options = BranchOptions(args.candidates, args.block_size, args.epsilon,
                             args.max_new_tokens, args.temperature, args.top_p,
                             args.max_candidates, args.min_unique_eligible)
     set_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.target)
     draft_tokenizer = AutoTokenizer.from_pretrained(args.draft)
+    if args.prompt_format == 'chat':
+        if not getattr(tokenizer, 'chat_template', None):
+            parser.error('Tokenizer has no chat template; use --prompt-format raw for a base model')
+        prompt_ids = tokenizer.apply_chat_template(
+            [{'role': 'user', 'content': args.prompt}], tokenize=True,
+            add_generation_prompt=True)
+    else:
+        prompt_ids = tokenizer.encode(args.prompt, add_special_tokens=True)
     dtype = getattr(torch, args.dtype)
     target = AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=dtype).to(args.target_device)
     draft = AutoModelForCausalLM.from_pretrained(args.draft, torch_dtype=dtype).to(args.draft_device)
     config = TransformersConfig(target, tokenizer, device=args.target_device)
     kgw_config = KGWConfig(str(Path(__file__).resolve().parents[1] / 'config/KGW.json'),
-                           config, hash_key=args.hash_key)
+                           config, hash_key=args.hash_key, gamma=args.gamma)
     wm = BranchKGW(kgw_config, config, draft, draft_tokenizer, options)
     seeds = args.seeds if args.seeds is not None else [args.seed]
     modes = ['watermarked', 'quality-only'] if args.compare else [args.mode]
@@ -66,7 +82,12 @@ def main():
                     torch.cuda.synchronize(device)
                     torch.cuda.reset_peak_memory_stats(device)
             start = time.perf_counter()
-            result = wm.generate(args.prompt, watermarked=mode == 'watermarked')
+            result = wm.generate(prompt_token_ids=prompt_ids, watermarked=mode == 'watermarked')
+            result['detection_fixed_lengths'] = {
+                'with_prompt': wm.detect_fixed_lengths(result['generated_token_ids'],
+                                                       args.detection_lengths, prompt_ids),
+                'without_prompt': wm.detect_fixed_lengths(result['generated_token_ids'],
+                                                          args.detection_lengths)}
             for device in devices:
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
@@ -97,6 +118,7 @@ def main():
             summaries.append({'seed': seed, 'mode': mode, 'output': str(output),
                               'generated_tokens': len(result['generated_token_ids']),
                               'detection': detection, 'diagnostics': result['diagnostics'],
+                              'detection_fixed_lengths': result['detection_fixed_lengths'],
                               'elapsed_seconds': elapsed,
                               'tokens_per_second': result['run']['tokens_per_second']})
     if args.compare or args.seeds is not None:

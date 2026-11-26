@@ -108,7 +108,21 @@ class BranchKGW(KGW):
         score = self.utils._compute_z_score(green, count) if count else None
         return {'score': score, 'is_watermarked': score is not None and score > self.config.z_threshold,
                 'num_tokens_scored': count, 'green_tokens': green,
+                'green_fraction': green / count if count else None,
+                'excess_green_tokens': green - self.config.gamma * count,
                 'threshold_is_calibrated': False}
+
+    def detect_fixed_lengths(self, continuation, lengths, prefix=()):
+        """Score exact-length prefixes; never substitute a shorter EOS output."""
+        results = {}
+        for length in lengths:
+            if not isinstance(length, int) or isinstance(length, bool) or length < 1:
+                raise ValueError('Detection lengths must be positive integers')
+            results[str(length)] = (
+                {'available': True, **self.detect_token_ids(continuation[:length], prefix)}
+                if len(continuation) >= length else
+                {'available': False, 'reason': 'output_too_short', 'score': None})
+        return results
 
     def _quality(self, prefix, candidate):
         model = self.config.generation_model
@@ -120,9 +134,15 @@ class BranchKGW(KGW):
         return logits.log_softmax(-1).gather(-1, labels[:, None]).mean().item()
 
     @torch.inference_mode()
-    def generate(self, prompt, watermarked=True):
+    def generate(self, prompt=None, watermarked=True, *, prompt_token_ids=None):
         tokenizer = self.config.generation_tokenizer
-        prefix = tokenizer.encode(prompt, add_special_tokens=True)
+        if (prompt is None) == (prompt_token_ids is None):
+            raise ValueError('Provide exactly one of prompt or prompt_token_ids')
+        prefix = (tokenizer.encode(prompt, add_special_tokens=True)
+                  if prompt_token_ids is None else list(prompt_token_ids))
+        if any(not isinstance(t, int) or isinstance(t, bool) or
+               not 0 <= t < self.config.vocab_size for t in prefix):
+            raise ValueError('Prompt token IDs must be integers within the vocabulary')
         if not prefix:
             raise ValueError('Prompt must encode to at least one token')
         o = self.options
@@ -189,6 +209,8 @@ class BranchKGW(KGW):
                           'unique_candidate_count': len(candidates),
                           'duplicate_candidate_count': sampled - len(candidates),
                           'unique_eligible_count': len(valid), 'quality_best_index': best,
+                          'eligible_watermark_tie': len({scores[i] for i in valid}) == 1,
+                          'watermark_gain_available': max(scores[i] for i in valid) - scores[best],
                           'selection_changed': chosen != best,
                           'quality_loss': qualities[best] - qualities[chosen],
                           'watermark_gain': gain, 'selection_reason': reason,
@@ -215,6 +237,16 @@ class BranchKGW(KGW):
             'duplicate_candidates': sum(b['duplicate_candidate_count'] for b in trace),
             'local_watermark_gain_sum': sum(b['watermark_gain'] for b in trace),
             'mean_quality_loss': sum(b['quality_loss'] for b in trace) / len(trace),
+            'selection_changed_block_rate': sum(b['selection_changed'] for b in trace) / len(trace),
+            'duplicate_candidate_rate': sum(b['duplicate_candidate_count'] for b in trace) /
+                                        sum(b['sampled_candidate_count'] for b in trace),
+            'mean_unique_eligible': sum(b['unique_eligible_count'] for b in trace) / len(trace),
+            'multiple_eligible_watermark_tie_blocks': sum(
+                b['unique_eligible_count'] > 1 and b['eligible_watermark_tie'] for b in trace),
+            'quality_best_also_watermark_best_blocks': sum(
+                b['unique_eligible_count'] > 1 and not b['eligible_watermark_tie']
+                and b['watermark_gain_available'] == 0 for b in trace),
+            'positive_gain_available_blocks': sum(b['watermark_gain_available'] > 0 for b in trace),
         }
         self.last_result = result
         return result

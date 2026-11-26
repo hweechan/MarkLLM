@@ -35,8 +35,8 @@ python -m unittest discover -s tests -p 'test_branch_kgw.py' -v
 
 ```bash
 python -m examples.branch_kgw \
-  --target Qwen/Qwen2.5-1.5B \
-  --draft Qwen/Qwen2.5-0.5B \
+  --target Qwen/Qwen2.5-3B-Instruct \
+  --draft Qwen/Qwen2.5-1.5B-Instruct \
   --target-device cuda:0 --draft-device cuda:0 \
   --dtype bfloat16 \
   --prompt 'Explain why the sky appears blue in clear, simple terms.' \
@@ -45,15 +45,15 @@ python -m examples.branch_kgw \
   --output outputs/watermarked.json
 ```
 
-이는 작은 규모의 시작용 모델 조합이며 성능을 검증한 조합은 아닙니다. 두 모델의 BF16 가중치만 대략 4GB이고 실행에는 logits, KV cache 등의 추가 메모리가 필요합니다. 여유 있는 12~16GB급 GPU를 시작점으로 고려하되 실제 요구량은 문맥 길이와 후보 수 등에 따라 달라집니다. BF16 미지원 GPU는 `--dtype float16`을 사용하세요. CPU는 두 장치를 모두 `cpu`, dtype을 `float32`로 바꿉니다.
+이는 작은 규모의 시작용 모델 조합이며 성능을 검증한 조합은 아닙니다. 기본 1.5B/3B Instruct 조합의 BF16 가중치만 대략 9GB이고 실행에는 logits, KV cache 등의 추가 메모리가 필요합니다. GPU 메모리는 가중치 외의 실행 여유까지 확보해야 하며 실제 요구량은 문맥 길이와 후보 수 등에 따라 달라집니다. BF16 미지원 GPU는 `--dtype float16`을 사용하세요. CPU는 두 장치를 모두 `cpu`, dtype을 `float32`로 바꿉니다.
 
-더 큰 target을 쓰려면 `--target Qwen/Qwen2.5-7B`로 변경할 수 있습니다. 같은 모델 계열이어도 tokenizer 호환성은 실제 로드 시 확인합니다. OOM이면 먼저 후보 수와 문맥/출력 길이를 줄이거나 작은 target을 사용하세요.
+더 큰 target을 쓰려면 `--target Qwen/Qwen2.5-7B-Instruct`로 변경할 수 있습니다. 같은 모델 계열이어도 tokenizer 호환성은 실제 로드 시 확인합니다. OOM이면 먼저 후보 수와 문맥/출력 길이를 줄이거나 작은 target을 사용하세요.
 
 ## 3. 두 GPU에 분리
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python -m examples.branch_kgw \
-  --target Qwen/Qwen2.5-7B --draft Qwen/Qwen2.5-0.5B \
+  --target Qwen/Qwen2.5-7B-Instruct --draft Qwen/Qwen2.5-1.5B-Instruct \
   --target-device cuda:0 --draft-device cuda:1 \
   --max-new-tokens 256 --output outputs/two_gpu.json
 ```
@@ -173,3 +173,44 @@ EOS로 후보 길이가 다르면 W 차이를 Green 토큰 개수 차이로 해�
 여러 seed 비교를 지원합니다. 여러 prompt는 각각 다른 output 이름으로 실행하세요.
 KV cache 재사용, 후보 배치 평가, target 단독 기준선 및 자동 임계값 보정은
 이번 변경에 포함하지 않습니다.
+
+
+## 9. Instruct 입력과 gamma·동일 길이 비교
+
+CLI 기본 모델은 draft `Qwen/Qwen2.5-1.5B-Instruct`, target
+`Qwen/Qwen2.5-3B-Instruct`입니다. 기본 `--prompt-format chat`은 target tokenizer의
+chat template에 user 메시지와 generation prompt를 적용합니다. 토큰 ID를 생성기에
+직접 전달하므로 특수 토큰을 다시 추가하지 않습니다. Base 모델 재현에는
+`--prompt-format raw`를 지정하세요. Python API의 기존 문자열 입력은 raw 동작을
+유지하며, chat 입력은 `generate(prompt_token_ids=token_ids)`로 전달합니다.
+
+`--gamma`는 기본 0.5이며 생성·검출에 같은 값이 적용되고 run.kgw에 저장됩니다.
+완화한 epsilon 값을 고정하고 다음 명령의 gamma만 0.5/0.25로 바꿔 비교하세요.
+아래 0.4는 실행 예시이며 실제 실험에 사용한 epsilon으로 바꿔야 합니다.
+
+```bash
+python -m examples.branch_kgw \
+  --epsilon 0.4 --gamma 0.25 \
+  --candidates 4 --max-candidates 16 --min-unique-eligible 4 \
+  --max-new-tokens 256 --detection-lengths 64 128 256 \
+  --compare --seeds 42 43 44 --output outputs/gamma025.json
+```
+
+후보 예산과 min-unique-eligible 효과는 gamma를 고정한 별도 비교로 확인하세요.
+기존 후보 예산 기본값과 epsilon 기본값은 유지합니다.
+
+검출 결과에 `green_fraction`, `excess_green_tokens`를 추가했습니다.
+`detection_fixed_lengths`는 지정한 길이의 continuation 앞부분을 with_prompt와
+without_prompt 방식으로 각각 평가합니다. 길이는 special token을 포함한 생성 ID
+개수이며 without_prompt는 첫 prefix_length 토큰을 점수에서 제외합니다.
+출력이 짧으면 `available=false`, `score=null`로 기록하며 짧은 출력을 동일 길이
+점수로 대체하지 않습니다. 비교 시 양쪽 모두 해당 길이에 도달한 prompt/seed를
+맞추고, 길이 도달률도 보고해야 조기 종료에 따른 편향을 확인할 수 있습니다.
+
+진단에는 블록 기준 `selection_changed_block_rate`, 중복 후보 비율,
+평균 고유 유효 후보 수, 유효 후보가 여럿인 W 동점 블록 수,
+최고 Q 후보가 최고 W이기도 한 비동점 블록 수, 양의 W 이득이 가능한 블록 수를
+추가했습니다. 마지막 값은 실제 변경 여부와 독립적으로 quality-only에도 계산합니다.
+블록 변경률은 변경된 토큰 비율이 아닙니다. 기존 local_watermark_gain_sum과
+mean_quality_loss도 함께 비교하세요. 임계값 변경이나 위치 추정 검출,
+Gumbel 샘플링은 이 변경에 포함하지 않습니다.
